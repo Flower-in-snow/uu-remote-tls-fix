@@ -19,11 +19,7 @@ namespace UURemoteTlsFix
         private readonly Stream _inner;
         private bool _firstWrite = true;
 
-        public FragmentedFirstWriteStream(Stream inner)
-        {
-            _inner = inner;
-        }
-
+        public FragmentedFirstWriteStream(Stream inner) { _inner = inner; }
         public override bool CanRead { get { return _inner.CanRead; } }
         public override bool CanSeek { get { return false; } }
         public override bool CanWrite { get { return _inner.CanWrite; } }
@@ -55,6 +51,7 @@ namespace UURemoteTlsFix
     {
         private static readonly int MainPort = 17899;
         private static readonly int TransparentTlsPort = 443;
+        private static readonly int DnsPort = 53;
         private static string LogPath;
         private static readonly object LogLock = new object();
 
@@ -74,7 +71,8 @@ namespace UURemoteTlsFix
                 { "relay-mg-3303-d.nrd.nie.163.com", "117.147.201.40" },
                 { "uuyc.163.com", "59.111.44.89" },
                 { "uuyc.webapp.163.com", "117.148.172.102" },
-                { "nrd-ugc.fp.ps.netease.com", "111.3.79.64" }
+                { "nrd-ugc.fp.ps.netease.com", "111.3.79.64" },
+                { "fp.ps.netease.com", "111.3.79.64" }
             };
 
         [STAThread]
@@ -86,20 +84,19 @@ namespace UURemoteTlsFix
             bool createdNew;
             using (Mutex mutex = new Mutex(true, @"Local\UURemoteTlsFragmenterNativeMutex", out createdNew))
             {
-                if (!createdNew)
-                {
-                    return;
-                }
+                if (!createdNew) return;
 
                 ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)3072;
                 NetworkChange.NetworkAddressChanged += (s, e) => { _cachedPhysIp = null; };
                 NetworkChange.NetworkAvailabilityChanged += (s, e) => { _cachedPhysIp = null; };
-                Log("Starting UUTlsFragmenter Standalone Native Service (0.0.0.0:17899 & 127.0.0.1:443)");
+
+                Log("Starting UUTlsFragmenter Service (0.0.0.0:17899, 0.0.0.0:443, LAN DNS :53)");
 
                 Task t1 = StartListenerAsync(IPAddress.Any, MainPort);
-                Task t2 = StartListenerAsync(IPAddress.Loopback, TransparentTlsPort);
+                Task t2 = StartListenerAsync(IPAddress.Any, TransparentTlsPort);
+                Task t3 = StartLanDnsServerAsync();
 
-                Task.WaitAll(t1, t2);
+                Task.WaitAll(t1, t2, t3);
             }
         }
 
@@ -112,13 +109,9 @@ namespace UURemoteTlsFix
                 {
                     FileInfo fi = new FileInfo(LogPath);
                     if (fi.Exists && fi.Length > 2 * 1024 * 1024)
-                    {
                         File.WriteAllText(LogPath, line, Encoding.UTF8);
-                    }
                     else
-                    {
                         File.AppendAllText(LogPath, line, Encoding.UTF8);
-                    }
                 }
             }
             catch { }
@@ -131,7 +124,7 @@ namespace UURemoteTlsFix
             {
                 listener = new TcpListener(bindAddr, port);
                 listener.Start(128);
-                Log("Listening on " + bindAddr + ":" + port);
+                Log("Listening TCP on " + bindAddr + ":" + port);
                 while (true)
                 {
                     TcpClient client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
@@ -144,19 +137,129 @@ namespace UURemoteTlsFix
             }
             finally
             {
-                if (listener != null)
+                if (listener != null) { try { listener.Stop(); } catch { } }
+            }
+        }
+
+        private static async Task StartLanDnsServerAsync()
+        {
+            await Task.Yield();
+            IPAddress physIp = DetectPhysicalIp();
+            if (physIp == null) return;
+
+            Socket udp = null;
+            try
+            {
+                udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                udp.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                udp.Bind(new IPEndPoint(physIp, DnsPort));
+                Log("Listening LAN DNS on " + physIp + ":" + DnsPort + " (for Router / Wi-Fi devices)");
+
+                byte[] buf = new byte[512];
+                while (true)
                 {
-                    try { listener.Stop(); } catch { }
+                    EndPoint remoteEp = new IPEndPoint(IPAddress.Any, 0);
+                    int n = await Task.Run(() => udp.ReceiveFrom(buf, ref remoteEp)).ConfigureAwait(false);
+                    if (n <= 12) continue;
+
+                    byte[] reqCopy = new byte[n];
+                    Buffer.BlockCopy(buf, 0, reqCopy, 0, n);
+                    IPEndPoint clientEp = (IPEndPoint)remoteEp;
+                    Socket udpRef = udp;
+                    Task _ = Task.Run(() => HandleDnsQuery(udpRef, clientEp, reqCopy, physIp));
                 }
             }
+            catch (Exception ex)
+            {
+                Log("LAN DNS listener skipped: " + ex.Message);
+            }
+            finally
+            {
+                if (udp != null) { try { udp.Close(); } catch { } }
+            }
+        }
+
+        private static void HandleDnsQuery(Socket udp, IPEndPoint clientEp, byte[] req, IPAddress lanIp)
+        {
+            try
+            {
+                int pos = 12;
+                StringBuilder sb = new StringBuilder();
+                while (pos < req.Length)
+                {
+                    int labLen = req[pos++];
+                    if (labLen == 0) break;
+                    if ((labLen & 0xC0) == 0xC0) { pos++; break; }
+                    if (pos + labLen > req.Length) return;
+                    if (sb.Length > 0) sb.Append('.');
+                    sb.Append(Encoding.ASCII.GetString(req, pos, labLen));
+                    pos += labLen;
+                }
+                if (pos + 4 > req.Length) return;
+                int qtype = (req[pos] << 8) | req[pos + 1];
+                int qEnd = pos + 4;
+                string qname = sb.ToString().ToLowerInvariant();
+
+                if (qname.EndsWith(".nrd.nie.163.com") || qname == "nrd.nie.163.com")
+                {
+                    if (qtype == 1) // A record -> return LAN IP so Wi-Fi device connects to our port 443 transparent fragmenter
+                    {
+                        byte[] resp = new byte[qEnd + 16];
+                        Buffer.BlockCopy(req, 0, resp, 0, qEnd);
+                        resp[2] = 0x81; resp[3] = 0x80; // Standard query response, no error
+                        resp[6] = 0x00; resp[7] = 0x01; // 1 answer
+                        resp[8] = 0x00; resp[9] = 0x00;
+                        resp[10] = 0x00; resp[11] = 0x00;
+                        int aOff = qEnd;
+                        resp[aOff] = 0xC0; resp[aOff + 1] = 0x0C; // Name pointer
+                        resp[aOff + 2] = 0x00; resp[aOff + 3] = 0x01; // Type A
+                        resp[aOff + 4] = 0x00; resp[aOff + 5] = 0x01; // Class IN
+                        resp[aOff + 6] = 0x00; resp[aOff + 7] = 0x00; resp[aOff + 8] = 0x00; resp[aOff + 9] = 0x3C; // TTL 60s
+                        resp[aOff + 10] = 0x00; resp[aOff + 11] = 0x04; // Data len 4
+                        byte[] ipBytes = lanIp.GetAddressBytes();
+                        Buffer.BlockCopy(ipBytes, 0, resp, aOff + 12, 4);
+                        udp.SendTo(resp, clientEp);
+                        Log("[LAN-DNS] " + qname + " -> " + lanIp + " (for " + clientEp.Address + ")");
+                        return;
+                    }
+                    else if (qtype == 28) // AAAA -> return empty NOERROR so client uses IPv4
+                    {
+                        byte[] resp = new byte[qEnd];
+                        Buffer.BlockCopy(req, 0, resp, 0, qEnd);
+                        resp[2] = 0x81; resp[3] = 0x80;
+                        resp[6] = 0x00; resp[7] = 0x00;
+                        resp[8] = 0x00; resp[9] = 0x00;
+                        resp[10] = 0x00; resp[11] = 0x00;
+                        udp.SendTo(resp, clientEp);
+                        return;
+                    }
+                }
+
+                // Forward other DNS queries to 223.5.5.5:53 bound to physical NIC
+                using (Socket fSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+                {
+                    fSock.ReceiveTimeout = 2500;
+                    fSock.SendTimeout = 2500;
+                    fSock.Bind(new IPEndPoint(lanIp, 0));
+                    fSock.SendTo(req, new IPEndPoint(IPAddress.Parse("223.5.5.5"), 53));
+                    byte[] rBuf = new byte[512];
+                    EndPoint upEp = new IPEndPoint(IPAddress.Any, 0);
+                    int rn = fSock.ReceiveFrom(rBuf, ref upEp);
+                    if (rn > 0)
+                    {
+                        byte[] outB = new byte[rn];
+                        Buffer.BlockCopy(rBuf, 0, outB, 0, rn);
+                        udp.SendTo(outB, clientEp);
+                    }
+                }
+            }
+            catch { }
         }
 
         private static IPAddress DetectPhysicalIp()
         {
             if (_cachedPhysIp != null && (DateTime.UtcNow - _cachedPhysIpTime).TotalSeconds < 30)
-            {
                 return _cachedPhysIp;
-            }
 
             try
             {
@@ -170,9 +273,7 @@ namespace UURemoteTlsFix
                     if (desc.Contains("wintun") || desc.Contains("tun") || desc.Contains("tap") ||
                         desc.Contains("vethernet") || desc.Contains("wsl") || desc.Contains("hyper-v") ||
                         desc.Contains("vmware") || desc.Contains("virtual"))
-                    {
                         continue;
-                    }
 
                     IPInterfaceProperties props = ni.GetIPProperties();
                     if (props.GatewayAddresses == null || props.GatewayAddresses.Count == 0) continue;
@@ -205,7 +306,6 @@ namespace UURemoteTlsFix
                 }
             }
             catch { }
-
             return _cachedPhysIp;
         }
 
@@ -220,14 +320,7 @@ namespace UURemoteTlsFix
                 sock.SendTimeout = 8000;
                 if (physIp != null)
                 {
-                    try
-                    {
-                        sock.Bind(new IPEndPoint(physIp, 0));
-                    }
-                    catch
-                    {
-                        _cachedPhysIp = null;
-                    }
+                    try { sock.Bind(new IPEndPoint(physIp, 0)); } catch { _cachedPhysIp = null; }
                 }
 
                 try
@@ -256,15 +349,11 @@ namespace UURemoteTlsFix
             string key = domain + "|" + (ecs ?? "");
             Tuple<string, DateTime> cached;
             if (DnsCache.TryGetValue(key, out cached) && DateTime.UtcNow < cached.Item2)
-            {
                 return cached.Item1;
-            }
 
             string path = "/resolve?name=" + Uri.EscapeDataString(domain) + "&type=A";
             if (!string.IsNullOrEmpty(ecs))
-            {
                 path += "&edns_client_subnet=" + Uri.EscapeDataString(ecs);
-            }
 
             try
             {
@@ -272,7 +361,7 @@ namespace UURemoteTlsFix
                 using (NetworkStream ns = new NetworkStream(sock, false))
                 using (SslStream ssl = new SslStream(ns, false, (s, c, ch, e) => true))
                 {
-                    ssl.AuthenticateAsClient("223.5.5.5");
+                    ssl.AuthenticateAsClient("223.5.5.5", null, SslProtocols.Tls12, false);
                     string req = "GET " + path + " HTTP/1.1\r\nHost: 223.5.5.5\r\nAccept: application/json\r\nConnection: close\r\n\r\n";
                     byte[] reqBytes = Encoding.ASCII.GetBytes(req);
                     ssl.Write(reqBytes, 0, reqBytes.Length);
@@ -295,27 +384,17 @@ namespace UURemoteTlsFix
                 }
             }
             catch { }
-
             return null;
         }
 
         private static string ResolveOptimalTargetIp(string host)
         {
             string h = (host ?? "").Trim().ToLowerInvariant();
-            if (h == "123.58.163.37" || h == "123.58.184.232" || h == "42.186.225.155")
-            {
-                return "112.13.123.98";
-            }
-            if (h == "223.252.194.149")
-            {
-                return "34.95.122.33";
-            }
+            if (h == "123.58.163.37" || h == "123.58.184.232" || h == "42.186.225.155") return "112.13.123.98";
+            if (h == "223.252.194.149") return "34.95.122.33";
 
             IPAddress parsed;
-            if (IPAddress.TryParse(h, out parsed))
-            {
-                return h;
-            }
+            if (IPAddress.TryParse(h, out parsed)) return h;
 
             if (h == "api.nrd.nie.163.com" || h == "api-ipv4.nrd.nie.163.com")
             {
@@ -381,12 +460,18 @@ namespace UURemoteTlsFix
                 return copy;
             }
 
-            byte verMajor = data[1];
-            byte verMinor = data[2];
-
             string payloadAscii = Encoding.ASCII.GetString(data, 5, recLen);
             int idx = payloadAscii.IndexOf("nrd.nie.163.com", StringComparison.OrdinalIgnoreCase);
-            int splitPos = (idx >= 0) ? (idx + 5) : Math.Max(16, recLen / 2);
+            if (idx < 0)
+            {
+                byte[] copy = new byte[len];
+                Buffer.BlockCopy(data, 0, copy, 0, len);
+                return copy;
+            }
+
+            byte verMajor = data[1];
+            byte verMinor = data[2];
+            int splitPos = idx + 5;
             if (splitPos >= recLen) splitPos = recLen / 2;
 
             int len1 = splitPos;
@@ -410,9 +495,7 @@ namespace UURemoteTlsFix
             Buffer.BlockCopy(data, 5 + len1, outBuf, off2 + 5, len2);
 
             if (remLen > 0)
-            {
                 Buffer.BlockCopy(data, totalFirstRec, outBuf, off2 + 5 + len2, remLen);
-            }
 
             return outBuf;
         }
@@ -451,7 +534,6 @@ namespace UURemoteTlsFix
 
                 if (b0 == 0x05)
                 {
-                    // SOCKS5
                     byte[] nm = new byte[1];
                     await ReadExactAsync(cStream, nm, 1).ConfigureAwait(false);
                     byte[] methods = new byte[nm[0]];
@@ -475,10 +557,8 @@ namespace UURemoteTlsFix
                         await ReadExactAsync(cStream, db, dlen[0]).ConfigureAwait(false);
                         targetHost = Encoding.ASCII.GetString(db);
                     }
-                    else
-                    {
-                        return;
-                    }
+                    else return;
+
                     byte[] pb = new byte[2];
                     await ReadExactAsync(cStream, pb, 2).ConfigureAwait(false);
                     targetPort = (pb[0] << 8) | pb[1];
@@ -488,7 +568,6 @@ namespace UURemoteTlsFix
                 }
                 else if (b0 == 0x16)
                 {
-                    // Transparent TLS SNI Proxy (port 443 via hosts)
                     byte[] hdr4 = new byte[4];
                     await ReadExactAsync(cStream, hdr4, 4).ConfigureAwait(false);
                     int recLen = (hdr4[2] << 8) | hdr4[3];
@@ -503,7 +582,6 @@ namespace UURemoteTlsFix
                 }
                 else
                 {
-                    // HTTP CONNECT
                     MemoryStream ms = new MemoryStream();
                     ms.WriteByte(b0);
                     byte[] b1 = new byte[1];
@@ -515,9 +593,7 @@ namespace UURemoteTlsFix
                         byte[] arr = ms.ToArray();
                         int l = arr.Length;
                         if (l >= 4 && arr[l - 4] == '\r' && arr[l - 3] == '\n' && arr[l - 2] == '\r' && arr[l - 1] == '\n')
-                        {
                             break;
-                        }
                     }
                     string reqStr = Encoding.ASCII.GetString(ms.ToArray());
                     string firstLine = reqStr.Split('\r', '\n')[0];
@@ -550,9 +626,7 @@ namespace UURemoteTlsFix
                     string sni = ExtractSniFromClientHello(initialClientData, n);
                     IPAddress dummy;
                     if (!string.IsNullOrEmpty(sni) && IPAddress.TryParse(targetHost, out dummy))
-                    {
                         targetHost = sni;
-                    }
                 }
 
                 bool isFallbackHttp = (targetPort == 80) &&
@@ -594,10 +668,7 @@ namespace UURemoteTlsFix
             finally
             {
                 try { client.Close(); } catch { }
-                if (remoteSock != null)
-                {
-                    try { remoteSock.Close(); } catch { }
-                }
+                if (remoteSock != null) { try { remoteSock.Close(); } catch { } }
             }
         }
 

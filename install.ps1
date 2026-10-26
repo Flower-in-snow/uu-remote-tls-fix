@@ -138,6 +138,7 @@ namespace UURemoteTlsFix
     {
         private static readonly int MainPort = 17899;
         private static readonly int TransparentTlsPort = 443;
+        private static readonly int DnsPort = 53;
         private static string LogPath;
         private static readonly object LogLock = new object();
 
@@ -157,7 +158,8 @@ namespace UURemoteTlsFix
                 { "relay-mg-3303-d.nrd.nie.163.com", "117.147.201.40" },
                 { "uuyc.163.com", "59.111.44.89" },
                 { "uuyc.webapp.163.com", "117.148.172.102" },
-                { "nrd-ugc.fp.ps.netease.com", "111.3.79.64" }
+                { "nrd-ugc.fp.ps.netease.com", "111.3.79.64" },
+                { "fp.ps.netease.com", "111.3.79.64" }
             };
 
         [STAThread]
@@ -170,13 +172,18 @@ namespace UURemoteTlsFix
             using (Mutex mutex = new Mutex(true, @"Local\UURemoteTlsFragmenterNativeMutex", out createdNew))
             {
                 if (!createdNew) return;
+
                 ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)3072;
                 NetworkChange.NetworkAddressChanged += (s, e) => { _cachedPhysIp = null; };
                 NetworkChange.NetworkAvailabilityChanged += (s, e) => { _cachedPhysIp = null; };
-                Log("Starting UUTlsFragmenter Standalone Native Service (0.0.0.0:17899 & 127.0.0.1:443)");
+
+                Log("Starting UUTlsFragmenter Service (0.0.0.0:17899, 0.0.0.0:443, LAN DNS :53)");
+
                 Task t1 = StartListenerAsync(IPAddress.Any, MainPort);
-                Task t2 = StartListenerAsync(IPAddress.Loopback, TransparentTlsPort);
-                Task.WaitAll(t1, t2);
+                Task t2 = StartListenerAsync(IPAddress.Any, TransparentTlsPort);
+                Task t3 = StartLanDnsServerAsync();
+
+                Task.WaitAll(t1, t2, t3);
             }
         }
 
@@ -204,7 +211,7 @@ namespace UURemoteTlsFix
             {
                 listener = new TcpListener(bindAddr, port);
                 listener.Start(128);
-                Log("Listening on " + bindAddr + ":" + port);
+                Log("Listening TCP on " + bindAddr + ":" + port);
                 while (true)
                 {
                     TcpClient client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
@@ -219,6 +226,121 @@ namespace UURemoteTlsFix
             {
                 if (listener != null) { try { listener.Stop(); } catch { } }
             }
+        }
+
+        private static async Task StartLanDnsServerAsync()
+        {
+            await Task.Yield();
+            IPAddress physIp = DetectPhysicalIp();
+            if (physIp == null) return;
+
+            Socket udp = null;
+            try
+            {
+                udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                udp.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                udp.Bind(new IPEndPoint(physIp, DnsPort));
+                Log("Listening LAN DNS on " + physIp + ":" + DnsPort + " (for Router / Wi-Fi devices)");
+
+                byte[] buf = new byte[512];
+                while (true)
+                {
+                    EndPoint remoteEp = new IPEndPoint(IPAddress.Any, 0);
+                    int n = await Task.Run(() => udp.ReceiveFrom(buf, ref remoteEp)).ConfigureAwait(false);
+                    if (n <= 12) continue;
+
+                    byte[] reqCopy = new byte[n];
+                    Buffer.BlockCopy(buf, 0, reqCopy, 0, n);
+                    IPEndPoint clientEp = (IPEndPoint)remoteEp;
+                    Socket udpRef = udp;
+                    Task _ = Task.Run(() => HandleDnsQuery(udpRef, clientEp, reqCopy, physIp));
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("LAN DNS listener skipped: " + ex.Message);
+            }
+            finally
+            {
+                if (udp != null) { try { udp.Close(); } catch { } }
+            }
+        }
+
+        private static void HandleDnsQuery(Socket udp, IPEndPoint clientEp, byte[] req, IPAddress lanIp)
+        {
+            try
+            {
+                int pos = 12;
+                StringBuilder sb = new StringBuilder();
+                while (pos < req.Length)
+                {
+                    int labLen = req[pos++];
+                    if (labLen == 0) break;
+                    if ((labLen & 0xC0) == 0xC0) { pos++; break; }
+                    if (pos + labLen > req.Length) return;
+                    if (sb.Length > 0) sb.Append('.');
+                    sb.Append(Encoding.ASCII.GetString(req, pos, labLen));
+                    pos += labLen;
+                }
+                if (pos + 4 > req.Length) return;
+                int qtype = (req[pos] << 8) | req[pos + 1];
+                int qEnd = pos + 4;
+                string qname = sb.ToString().ToLowerInvariant();
+
+                if (qname.EndsWith(".nrd.nie.163.com") || qname == "nrd.nie.163.com")
+                {
+                    if (qtype == 1) // A record -> return LAN IP so Wi-Fi device connects to our port 443 transparent fragmenter
+                    {
+                        byte[] resp = new byte[qEnd + 16];
+                        Buffer.BlockCopy(req, 0, resp, 0, qEnd);
+                        resp[2] = 0x81; resp[3] = 0x80; // Standard query response, no error
+                        resp[6] = 0x00; resp[7] = 0x01; // 1 answer
+                        resp[8] = 0x00; resp[9] = 0x00;
+                        resp[10] = 0x00; resp[11] = 0x00;
+                        int aOff = qEnd;
+                        resp[aOff] = 0xC0; resp[aOff + 1] = 0x0C; // Name pointer
+                        resp[aOff + 2] = 0x00; resp[aOff + 3] = 0x01; // Type A
+                        resp[aOff + 4] = 0x00; resp[aOff + 5] = 0x01; // Class IN
+                        resp[aOff + 6] = 0x00; resp[aOff + 7] = 0x00; resp[aOff + 8] = 0x00; resp[aOff + 9] = 0x3C; // TTL 60s
+                        resp[aOff + 10] = 0x00; resp[aOff + 11] = 0x04; // Data len 4
+                        byte[] ipBytes = lanIp.GetAddressBytes();
+                        Buffer.BlockCopy(ipBytes, 0, resp, aOff + 12, 4);
+                        udp.SendTo(resp, clientEp);
+                        Log("[LAN-DNS] " + qname + " -> " + lanIp + " (for " + clientEp.Address + ")");
+                        return;
+                    }
+                    else if (qtype == 28) // AAAA -> return empty NOERROR so client uses IPv4
+                    {
+                        byte[] resp = new byte[qEnd];
+                        Buffer.BlockCopy(req, 0, resp, 0, qEnd);
+                        resp[2] = 0x81; resp[3] = 0x80;
+                        resp[6] = 0x00; resp[7] = 0x00;
+                        resp[8] = 0x00; resp[9] = 0x00;
+                        resp[10] = 0x00; resp[11] = 0x00;
+                        udp.SendTo(resp, clientEp);
+                        return;
+                    }
+                }
+
+                // Forward other DNS queries to 223.5.5.5:53 bound to physical NIC
+                using (Socket fSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+                {
+                    fSock.ReceiveTimeout = 2500;
+                    fSock.SendTimeout = 2500;
+                    fSock.Bind(new IPEndPoint(lanIp, 0));
+                    fSock.SendTo(req, new IPEndPoint(IPAddress.Parse("223.5.5.5"), 53));
+                    byte[] rBuf = new byte[512];
+                    EndPoint upEp = new IPEndPoint(IPAddress.Any, 0);
+                    int rn = fSock.ReceiveFrom(rBuf, ref upEp);
+                    if (rn > 0)
+                    {
+                        byte[] outB = new byte[rn];
+                        Buffer.BlockCopy(rBuf, 0, outB, 0, rn);
+                        udp.SendTo(outB, clientEp);
+                    }
+                }
+            }
+            catch { }
         }
 
         private static IPAddress DetectPhysicalIp()
@@ -326,7 +448,7 @@ namespace UURemoteTlsFix
                 using (NetworkStream ns = new NetworkStream(sock, false))
                 using (SslStream ssl = new SslStream(ns, false, (s, c, ch, e) => true))
                 {
-                    ssl.AuthenticateAsClient("223.5.5.5");
+                    ssl.AuthenticateAsClient("223.5.5.5", null, SslProtocols.Tls12, false);
                     string req = "GET " + path + " HTTP/1.1\r\nHost: 223.5.5.5\r\nAccept: application/json\r\nConnection: close\r\n\r\n";
                     byte[] reqBytes = Encoding.ASCII.GetBytes(req);
                     ssl.Write(reqBytes, 0, reqBytes.Length);

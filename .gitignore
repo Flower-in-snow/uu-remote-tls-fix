@@ -1,0 +1,19 @@
+# Runtime logs & compiled binaries
+*.log
+*.exe
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Backups & local configs
+backup*/
+*.bak
+.env
+
+# OS files
+.DS_Store
+Thumbs.db

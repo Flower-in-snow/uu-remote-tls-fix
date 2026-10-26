@@ -171,9 +171,11 @@ namespace UURemoteTlsFix
             {
                 if (!createdNew) return;
                 ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)3072;
-                Log("Starting UUTlsFragmenter Standalone Native Service (127.0.0.1:17899 & 127.0.0.1:443)");
-                Task t1 = StartListenerAsync(MainPort);
-                Task t2 = StartListenerAsync(TransparentTlsPort);
+                NetworkChange.NetworkAddressChanged += (s, e) => { _cachedPhysIp = null; };
+                NetworkChange.NetworkAvailabilityChanged += (s, e) => { _cachedPhysIp = null; };
+                Log("Starting UUTlsFragmenter Standalone Native Service (0.0.0.0:17899 & 127.0.0.1:443)");
+                Task t1 = StartListenerAsync(IPAddress.Any, MainPort);
+                Task t2 = StartListenerAsync(IPAddress.Loopback, TransparentTlsPort);
                 Task.WaitAll(t1, t2);
             }
         }
@@ -195,14 +197,14 @@ namespace UURemoteTlsFix
             catch { }
         }
 
-        private static async Task StartListenerAsync(int port)
+        private static async Task StartListenerAsync(IPAddress bindAddr, int port)
         {
             TcpListener listener = null;
             try
             {
-                listener = new TcpListener(IPAddress.Loopback, port);
+                listener = new TcpListener(bindAddr, port);
                 listener.Start(128);
-                Log("Listening on 127.0.0.1:" + port);
+                Log("Listening on " + bindAddr + ":" + port);
                 while (true)
                 {
                     TcpClient client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
@@ -274,24 +276,37 @@ namespace UURemoteTlsFix
 
         private static Socket CreateBoundSocket(string targetIp, int targetPort)
         {
-            IPAddress physIp = DetectPhysicalIp();
-            Socket sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            sock.NoDelay = true;
-            sock.ReceiveTimeout = 8000;
-            sock.SendTimeout = 8000;
-            if (physIp != null)
+            for (int attempt = 0; attempt < 2; attempt++)
             {
-                try { sock.Bind(new IPEndPoint(physIp, 0)); } catch { }
-            }
+                IPAddress physIp = DetectPhysicalIp();
+                Socket sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                sock.NoDelay = true;
+                sock.ReceiveTimeout = 8000;
+                sock.SendTimeout = 8000;
+                if (physIp != null)
+                {
+                    try { sock.Bind(new IPEndPoint(physIp, 0)); } catch { _cachedPhysIp = null; }
+                }
 
-            IAsyncResult res = sock.BeginConnect(IPAddress.Parse(targetIp), targetPort, null, null);
-            if (!res.AsyncWaitHandle.WaitOne(5000, true))
-            {
-                sock.Close();
-                throw new TimeoutException("Connect timeout to " + targetIp + ":" + targetPort);
+                try
+                {
+                    IAsyncResult res = sock.BeginConnect(IPAddress.Parse(targetIp), targetPort, null, null);
+                    if (!res.AsyncWaitHandle.WaitOne(5000, true))
+                    {
+                        sock.Close();
+                        throw new TimeoutException("Connect timeout to " + targetIp + ":" + targetPort);
+                    }
+                    sock.EndConnect(res);
+                    return sock;
+                }
+                catch
+                {
+                    sock.Close();
+                    _cachedPhysIp = null;
+                    if (attempt == 1) throw;
+                }
             }
-            sock.EndConnect(res);
-            return sock;
+            throw new TimeoutException("Connect failed to " + targetIp + ":" + targetPort);
         }
 
         private static string QueryDoh223(string domain, string ecs)

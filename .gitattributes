@@ -1,0 +1,6 @@
+# bat/cmd 必须以 CRLF 字节原样存储。
+# 注意：不能用 `text eol=crlf` —— 那样仓库内仍存 LF，GitHub "Download ZIP"
+# 下载到的依旧是 LF，cmd.exe 会在 chcp 65001 后解析错位（首行乱码 / 无限弹窗）。
+# 用 -text 关闭行尾转换，保证 ZIP / raw 下载拿到的就是 CRLF。
+*.bat -text
+*.cmd -text
